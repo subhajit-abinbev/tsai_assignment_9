@@ -448,6 +448,8 @@ def train(rank, world_size, args):
     best_acc, start_epoch = 0.0, 0
     writer = SummaryWriter(args.log_dir) if rank == 0 else None
 
+    # TODO: Add gradient accumulation for large batch sizes
+
     for epoch in range(start_epoch, args.epochs):
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
