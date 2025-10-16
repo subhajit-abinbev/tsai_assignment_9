@@ -4,13 +4,13 @@
 
 ## 🎯 **Key Features**
 
-- **Enhanced ResNet-50 Architecture** with ResNet-D improvements
-- **Squeeze-and-Excitation (SE) blocks** for attention mechanism
-- **Advanced data augmentation** (RandAugment, MixUp, RandomErasing)
-- **Modern training techniques** (Label Smoothing, EMA, OneCycleLR)
-- **Distributed training support** for multi-GPU setups
-- **Learning rate finder** for optimal hyperparameter selection
-- **Mixed precision training** for faster training and memory efficiency
+- **ResNet-D Architecture** with 3-conv stem and optimized downsampling
+- **SE Attention Blocks** for adaptive channel feature recalibration
+- **Advanced Augmentation** (RandAugment, MixUp α=0.2, RandomErasing)
+- **Modern Training Stack** (Label Smoothing, EMA, OneCycleLR, Gradient Clipping)
+- **Multi-GPU Support** with distributed training and SyncBatchNorm
+- **LR Range Test** for automatic optimal learning rate discovery
+- **Mixed Precision** training with AMP for speed and memory efficiency
 
 ## 🏗️ **Architecture Improvements**
 
