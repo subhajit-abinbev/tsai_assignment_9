@@ -12,6 +12,35 @@ from torchvision.transforms import RandAugment
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
+import boto3
+from botocore.exceptions import ClientError
+
+# ==========================================================
+# 0. S3 Utilities
+# ==========================================================
+def upload_to_s3(local_path, bucket, s3_path):
+    """Upload file to S3"""
+    s3 = boto3.client('s3')
+    try:
+        s3.upload_file(local_path, bucket, s3_path)
+        print(f"✅ Uploaded {local_path} → s3://{bucket}/{s3_path}")
+    except ClientError as e:
+        print(f"⚠️ Failed to upload {local_path}: {e}")
+
+def download_from_s3(bucket, s3_path, local_path):
+    """Download file from S3 if exists"""
+    s3 = boto3.client('s3')
+    try:
+        s3.download_file(bucket, s3_path, local_path)
+        print(f"✅ Downloaded checkpoint from s3://{bucket}/{s3_path}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == "404":
+            print("No checkpoint found on S3.")
+        else:
+            print(f"⚠️ Failed to download checkpoint: {e}")
+        return False
+
 
 # ==========================================================
 # 1.  ResNet-50 architecture (from scratch)
@@ -450,6 +479,33 @@ def train(rank, world_size, args):
 
     # TODO: Add gradient accumulation for large batch sizes
 
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_acc = 0.0
+    local_ckpt_dir = args.output_dir
+    os.makedirs(local_ckpt_dir, exist_ok=True)
+
+    if args.resume and args.s3_bucket:
+        s3 = boto3.client('s3')
+        response = s3.list_objects_v2(Bucket=args.s3_bucket, Prefix=args.s3_prefix)
+        if 'Contents' in response:
+            checkpoints = sorted([obj['Key'] for obj in response['Contents'] if obj['Key'].endswith(".pth")])
+            if checkpoints:
+                latest_ckpt = checkpoints[-1]
+                local_ckpt_path = os.path.join(local_ckpt_dir, os.path.basename(latest_ckpt))
+                download_from_s3(args.s3_bucket, latest_ckpt, local_ckpt_path)
+                print(f"Resuming from checkpoint {latest_ckpt}")
+                checkpoint = torch.load(local_ckpt_path, map_location=device)
+                model.load_state_dict(checkpoint["model"])
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                scaler.load_state_dict(checkpoint["scaler"])
+                ema.shadow = checkpoint["ema"]
+                best_acc = checkpoint.get("best_acc", 0.0)
+                start_epoch = checkpoint["epoch"] + 1
+        else:
+            print("No existing checkpoints found on S3 — starting fresh.")
+
     for epoch in range(start_epoch, args.epochs):
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
@@ -514,6 +570,7 @@ def train(rank, world_size, args):
             best_acc = max(best_acc, val_acc)
             
             # Save checkpoint
+            ckpt_path = os.path.join(args.output_dir, f"ckpt_{epoch}.pth")
             save_checkpoint({
                 "epoch": epoch, 
                 "model": model.state_dict(),
@@ -522,12 +579,19 @@ def train(rank, world_size, args):
                 "scaler": scaler.state_dict(),
                 "best_acc": best_acc,
                 "ema": ema.shadow,  # Save EMA weights
-            }, os.path.join(args.output_dir, f"ckpt_{epoch}.pth"), best=is_best)
+            }, ckpt_path, best=is_best)
 
-    if writer: 
-        writer.close()
-    if args.distributed: 
-        dist.destroy_process_group()
+            # Upload to S3
+            if args.s3_bucket:
+                s3_path = f"{args.s3_prefix}/ckpt_{epoch}.pth"
+                upload_to_s3(ckpt_path, args.s3_bucket, s3_path)
+                if is_best:
+                    upload_to_s3(os.path.join(args.output_dir, "model_best.pth"), args.s3_bucket, f"{args.s3_prefix}/model_best.pth")
+
+                if writer: 
+                    writer.close()
+                if args.distributed: 
+                    dist.destroy_process_group()
 
 # ==========================================================
 # 5.  Main
@@ -547,6 +611,9 @@ def main():
     p.add_argument("--log-dir", default="./runs")
     p.add_argument("--distributed", action="store_true")
     p.add_argument("--find-lr", action="store_true")
+    p.add_argument("--s3-bucket", type=str, help="S3 bucket to store checkpoints")
+    p.add_argument("--s3-prefix", type=str, default="checkpoints", help="S3 prefix/path inside the bucket")
+    p.add_argument("--resume", action="store_true", help="Resume training from latest S3 checkpoint")
     args = p.parse_args()
 
     world_size = torch.cuda.device_count()
