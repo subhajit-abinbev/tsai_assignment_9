@@ -440,158 +440,164 @@ def train(rank, world_size, args):
         torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
-    train_loader, val_loader, num_classes = get_data(args)
-    model = build_model(num_classes, args.dataset, args.distributed).to(device)
-    if args.distributed:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+    try:
+        # ===============================
+        # 1. Data
+        # ===============================
+        train_loader, val_loader, num_classes = get_data(args)
 
-    # Initialize EMA
-    ema = EMA(model.module if args.distributed else model, decay=0.9999)
-
-    # Use label smoothing
-    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                          momentum=args.momentum, weight_decay=args.weight_decay)
-
-    # ===== LR Finder Mode =====
-    if args.find_lr:
-        lrs, losses = lr_finder(model, train_loader, criterion, optimizer, device)
-        if rank == 0:
-            np.savez("lr_finder_results.npz", lrs=lrs, losses=losses)
-            print("Saved lr_finder_results.npz (plot loss vs lr).")
-        return
-
-    # Fix steps_per_epoch calculation for distributed training
-    if args.distributed:
-        steps_per_epoch = len(train_loader)
-    else:
-        steps_per_epoch = math.ceil(len(train_loader.dataset) / args.batch_size)
-    
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.max_lr, epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch, pct_start=0.1,  # Better pct_start
-        anneal_strategy='cos', div_factor=10.0, final_div_factor=1e3
-    )
-
-    scaler = GradScaler()
-    best_acc, start_epoch = 0.0, 0
-    writer = SummaryWriter(args.log_dir) if rank == 0 else None
-
-    # TODO: Add gradient accumulation for large batch sizes
-
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    best_acc = 0.0
-    local_ckpt_dir = args.output_dir
-    os.makedirs(local_ckpt_dir, exist_ok=True)
-
-    if args.resume and args.s3_bucket:
-        s3 = boto3.client('s3')
-        response = s3.list_objects_v2(Bucket=args.s3_bucket, Prefix=args.s3_prefix)
-        if 'Contents' in response:
-            checkpoints = sorted([obj['Key'] for obj in response['Contents'] if obj['Key'].endswith(".pth")])
-            if checkpoints:
-                latest_ckpt = checkpoints[-1]
-                local_ckpt_path = os.path.join(local_ckpt_dir, os.path.basename(latest_ckpt))
-                download_from_s3(args.s3_bucket, latest_ckpt, local_ckpt_path)
-                print(f"Resuming from checkpoint {latest_ckpt}")
-                checkpoint = torch.load(local_ckpt_path, map_location=device)
-                model.load_state_dict(checkpoint["model"])
-                optimizer.load_state_dict(checkpoint["optimizer"])
-                scheduler.load_state_dict(checkpoint["scheduler"])
-                scaler.load_state_dict(checkpoint["scaler"])
-                ema.shadow = checkpoint["ema"]
-                best_acc = checkpoint.get("best_acc", 0.0)
-                start_epoch = checkpoint["epoch"] + 1
-        else:
-            print("No existing checkpoints found on S3 — starting fresh.")
-
-    for epoch in range(start_epoch, args.epochs):
+        # ===============================
+        # 2. Model
+        # ===============================
+        model = build_model(num_classes, args.dataset, args.distributed).to(device)
         if args.distributed:
-            train_loader.sampler.set_epoch(epoch)
-        model.train()
-        running = 0.0
-        pbar = tqdm(train_loader, disable=(rank != 0))
-        
-        for imgs, lbls in pbar:
-            imgs, lbls = imgs.to(device), lbls.to(device)
-            
-            # Apply MixUp with 50% probability
-            use_mixup = np.random.rand() < 0.5
-            if use_mixup:
-                imgs, lbls_a, lbls_b, lam = mixup_data(imgs, lbls, alpha=0.2)
-                
-                optimizer.zero_grad()
-                with autocast():
-                    out = model(imgs)
-                    loss = mixup_criterion(criterion, out, lbls_a, lbls_b, lam)
-            else:
-                optimizer.zero_grad()
-                with autocast():
-                    out = model(imgs)
-                    loss = criterion(out, lbls)
-            
-            scaler.scale(loss).backward()
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=False)
 
-            # Gradient clipping for stability
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # ===============================
+        # 3. EMA
+        # ===============================
+        ema_model = model.module if args.distributed else model
+        ema = EMA(ema_model, decay=0.9999)
 
-            scaler.step(optimizer)
-            scaler.update()
+        # ===============================
+        # 4. Criterion and Optimizer
+        # ===============================
+        criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+        optimizer = optim.SGD(model.parameters(), lr=args.lr,
+                              momentum=args.momentum, weight_decay=args.weight_decay)
 
-            # OneCycleLR step should be after optimizer step
-            scheduler.step()
+        steps_per_epoch = len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.max_lr, epochs=args.epochs,
+            steps_per_epoch=steps_per_epoch, pct_start=0.1,
+            anneal_strategy='cos', div_factor=10.0, final_div_factor=1e3
+        )
 
-            # Update EMA
-            ema.update(model.module if args.distributed else model)
+        scaler = GradScaler()
+        best_acc, start_epoch = 0.0, 0
+        writer = SummaryWriter(args.log_dir) if rank == 0 else None
 
-            running += loss.item()
-            
+        # ===============================
+        # 5. LR Finder Mode
+        # ===============================
+        if args.find_lr:
+            lrs, losses = lr_finder(model, train_loader, criterion, optimizer, device)
             if rank == 0:
-                current_lr = scheduler.get_last_lr()[0]
-                pbar.set_description(f"Epoch[{epoch+1}/{args.epochs}] Loss {loss.item():.4f} LR {current_lr:.6f}")
+                np.savez("lr_finder_results.npz", lrs=lrs, losses=losses)
+                print("Saved lr_finder_results.npz (plot loss vs lr).")
+            return
 
-        if rank == 0:
-            # Use the same evaluate function for all datasets (top-1 accuracy only)
-            model_to_eval = model.module if args.distributed else model
-            ema.apply_shadow(model_to_eval)
-            val_acc = evaluate(model_to_eval, val_loader, device)
-            ema.restore(model_to_eval)
-            avg_loss = running / len(train_loader)
-            print(f"Epoch {epoch+1}: Top1_Acc={val_acc:.2f}% Loss={avg_loss:.4f}")
-            
-            if writer:
-                writer.add_scalar("Loss/train", avg_loss, epoch)
-                writer.add_scalar("Acc/val_top1", val_acc, epoch)
-                writer.add_scalar("LR", scheduler.get_last_lr()[0], epoch)
-            
-            is_best = val_acc > best_acc
-            best_acc = max(best_acc, val_acc)
-            
-            # Save checkpoint
-            ckpt_path = os.path.join(args.output_dir, f"ckpt_{epoch}.pth")
-            save_checkpoint({
-                "epoch": epoch, 
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-                "best_acc": best_acc,
-                "ema": ema.shadow,  # Save EMA weights
-            }, ckpt_path, best=is_best)
+        # ===============================
+        # 6. Resume Checkpoint
+        # ===============================
+        local_ckpt_dir = args.output_dir
+        os.makedirs(local_ckpt_dir, exist_ok=True)
 
-            # Upload to S3
-            if args.s3_bucket:
-                s3_path = f"{args.s3_prefix}/ckpt_{epoch}.pth"
-                upload_to_s3(ckpt_path, args.s3_bucket, s3_path)
-                if is_best:
-                    upload_to_s3(os.path.join(args.output_dir, "model_best.pth"), args.s3_bucket, f"{args.s3_prefix}/model_best.pth")
+        if args.resume and args.s3_bucket:
+            s3 = boto3.client('s3')
+            response = s3.list_objects_v2(Bucket=args.s3_bucket, Prefix=args.s3_prefix)
+            if 'Contents' in response:
+                checkpoints = sorted([obj['Key'] for obj in response['Contents'] if obj['Key'].endswith(".pth")])
+                if checkpoints:
+                    latest_ckpt = checkpoints[-1]
+                    local_ckpt_path = os.path.join(local_ckpt_dir, os.path.basename(latest_ckpt))
+                    download_from_s3(args.s3_bucket, latest_ckpt, local_ckpt_path)
+                    checkpoint = torch.load(local_ckpt_path, map_location=device)
+                    model.load_state_dict(checkpoint["model"])
+                    optimizer.load_state_dict(checkpoint["optimizer"])
+                    scheduler.load_state_dict(checkpoint["scheduler"])
+                    scaler.load_state_dict(checkpoint["scaler"])
+                    ema.shadow = checkpoint["ema"]
+                    best_acc = checkpoint.get("best_acc", 0.0)
+                    start_epoch = checkpoint["epoch"] + 1
+                    if rank == 0:
+                        print(f"Resumed from checkpoint {latest_ckpt}")
 
-                if writer: 
-                    writer.close()
-                if args.distributed: 
-                    dist.destroy_process_group()
+        # ===============================
+        # 7. Training Loop
+        # ===============================
+        for epoch in range(start_epoch, args.epochs):
+            if args.distributed:
+                train_loader.sampler.set_epoch(epoch)
+
+            model.train()
+            running_loss = 0.0
+            pbar = tqdm(train_loader, disable=(rank != 0))
+
+            for imgs, lbls in pbar:
+                imgs, lbls = imgs.to(device), lbls.to(device)
+
+                # --- MixUp 50% probability ---
+                use_mixup = np.random.rand() < 0.5
+                if use_mixup:
+                    imgs, lbls_a, lbls_b, lam = mixup_data(imgs, lbls, alpha=0.2)
+                    optimizer.zero_grad()
+                    with autocast():
+                        out = model(imgs)
+                        loss = mixup_criterion(criterion, out, lbls_a, lbls_b, lam)
+                else:
+                    optimizer.zero_grad()
+                    with autocast():
+                        out = model(imgs)
+                        loss = criterion(out, lbls)
+
+                scaler.scale(loss).backward()
+
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                ema.update(model.module if args.distributed else model)
+
+                running_loss += loss.item()
+                if rank == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    pbar.set_description(f"Epoch[{epoch+1}/{args.epochs}] Loss {loss.item():.4f} LR {current_lr:.6f}")
+
+            # ============ Validation & Checkpointing ============
+            if rank == 0:
+                model_eval = model.module if args.distributed else model
+                ema.apply_shadow(model_eval)
+                val_acc = evaluate(model_eval, val_loader, device)
+                ema.restore(model_eval)
+
+                avg_loss = running_loss / len(train_loader)
+                print(f"Epoch {epoch+1}: Top1_Acc={val_acc:.2f}% Loss={avg_loss:.4f}")
+
+                if writer:
+                    writer.add_scalar("Loss/train", avg_loss, epoch)
+                    writer.add_scalar("Acc/val_top1", val_acc, epoch)
+                    writer.add_scalar("LR", scheduler.get_last_lr()[0], epoch)
+
+                # Save checkpoint
+                is_best = val_acc > best_acc
+                best_acc = max(best_acc, val_acc)
+                ckpt_path = os.path.join(args.output_dir, f"ckpt_{epoch}.pth")
+                save_checkpoint({
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "best_acc": best_acc,
+                    "ema": ema.shadow,
+                }, ckpt_path, best=is_best)
+
+                # S3 Upload
+                if args.s3_bucket:
+                    upload_to_s3(ckpt_path, args.s3_bucket, f"{args.s3_prefix}/ckpt_{epoch}.pth")
+                    if is_best:
+                        upload_to_s3(os.path.join(args.output_dir, "model_best.pth"), args.s3_bucket,
+                                     f"{args.s3_prefix}/model_best.pth")
+    finally:
+        if writer:
+            writer.close()
+        if args.distributed:
+            dist.destroy_process_group()
+
 
 # ==========================================================
 # 5.  Main
