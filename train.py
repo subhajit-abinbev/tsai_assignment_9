@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
 import boto3
-import pyarrow as pa
 from PIL import Image
 import io
+from datasets import load_from_disk
 
 # ==========================================================
 # 0. S3 Utilities
@@ -265,64 +265,44 @@ def get_data(args):
             root=args.data_dir, train=False, download=True, transform=val_transform
         )
     elif args.dataset.lower() in ["imagenet100", "imagenet"]:
-        # Use direct Arrow file loading
-        import pyarrow as pa
-        from PIL import Image
-        import io
+        # Use HuggingFace datasets directly
+        from datasets import load_from_disk
+        from torch.utils.data import Dataset
         
-        class ArrowImageNetDataset(torch.utils.data.Dataset):
-            def __init__(self, arrow_files, transform=None):
+        class HFImageNetDataset(Dataset):
+            def __init__(self, hf_dataset, transform=None):
+                self.hf_dataset = hf_dataset
                 self.transform = transform
-                self.samples = []
-                
-                print(f"Loading {len(arrow_files)} Arrow files...")
-                for file_path in arrow_files:
-                    try:
-                        print(f"Processing: {os.path.basename(file_path)}")
-                        with pa.memory_map(file_path, 'r') as source:
-                            table = pa.ipc.open_file(source).read_all()
-                            
-                        # Convert to Python objects
-                        for i in range(len(table)):
-                            row = table.take([i]).to_pylist()[0]
-                            self.samples.append(row)
-                            
-                    except Exception as e:
-                        print(f"Error loading {file_path}: {e}")
-                        continue
-                
-                print(f"Total samples loaded: {len(self.samples)}")
+                print(f"Dataset loaded with {len(self.hf_dataset)} samples")
             
             def __len__(self):
-                return len(self.samples)
+                return len(self.hf_dataset)
             
             def __getitem__(self, idx):
                 try:
-                    sample = self.samples[idx]
+                    sample = self.hf_dataset[idx]
+                    
+                    # Get image and label
                     image = sample['image']
                     label = sample['label']
                     
-                    # Handle different image formats
-                    if isinstance(image, dict):
-                        if 'bytes' in image:
-                            image_bytes = image['bytes']
-                            image = Image.open(io.BytesIO(image_bytes))
-                        elif 'path' in image:
-                            image = Image.open(image['path'])
-                        else:
-                            # Create dummy image if format unknown
-                            image = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    elif hasattr(image, 'convert'):  # Already PIL Image
-                        pass
-                    elif hasattr(image, 'shape'):  # NumPy array
-                        image = Image.fromarray(image)
+                    # Handle PIL Image (most common case for HF datasets)
+                    if hasattr(image, 'convert'):
+                        if image.mode != 'RGB':
+                            image = image.convert('RGB')
                     else:
-                        # Create dummy image
-                        image = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    
-                    # Ensure RGB format
-                    if image.mode != 'RGB':
-                        image = image.convert('RGB')
+                        # Handle other formats
+                        if isinstance(image, dict) and 'bytes' in image:
+                            import io
+                            image = Image.open(io.BytesIO(image['bytes']))
+                        elif hasattr(image, 'shape'):  # NumPy array
+                            image = Image.fromarray(image)
+                        else:
+                            # Fallback: create dummy image
+                            image = Image.new('RGB', (224, 224), color=(128, 128, 128))
+                        
+                        if image.mode != 'RGB':
+                            image = image.convert('RGB')
                     
                     # Apply transforms
                     if self.transform:
@@ -331,35 +311,25 @@ def get_data(args):
                     return image, label
                     
                 except Exception as e:
-                    print(f"Error processing sample {idx}: {e}")
-                    # Return dummy sample in case of error
-                    dummy_image = Image.new('RGB', (224, 224), color=(128, 128, 128))
+                    print(f"Error loading sample {idx}: {e}")
+                    # Return dummy sample
+                    dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     if self.transform:
-                        dummy_image = self.transform(dummy_image)
-                    return dummy_image, 0
+                        dummy = self.transform(dummy)
+                    return dummy, 0
         
-        # Find all Arrow files
-        print(f"Scanning for Arrow files in: {args.data_dir}")
-        arrow_files = []
-        for root, dirs, files in os.walk(args.data_dir):
-            for file in files:
-                if file.endswith('.arrow'):
-                    arrow_files.append(os.path.join(root, file))
-        
-        print(f"Found {len(arrow_files)} Arrow files")
-        
-        # Separate train and validation files
-        train_files = [f for f in arrow_files if 'train' in os.path.basename(f)]
-        val_files = [f for f in arrow_files if 'validation' in os.path.basename(f)]
-        
-        print(f"Train files: {len(train_files)}")
-        print(f"Validation files: {len(val_files)}")
-        
-        if not train_files or not val_files:
-            raise ValueError("Could not find both train and validation Arrow files")
+        # Load dataset using HuggingFace
+        print(f"Loading HuggingFace dataset from: {args.data_dir}")
+        try:
+            dataset = load_from_disk(args.data_dir)
+            print(f"✅ Dataset loaded successfully!")
+            print(f"Available splits: {list(dataset.keys())}")
+        except Exception as e:
+            raise ValueError(f"Failed to load dataset: {e}")
         
         num_classes = 1000 if args.dataset.lower() == "imagenet" else 100
         
+        # Define transforms
         train_transform = get_strong_transforms()
         val_transform = transforms.Compose([
             transforms.Resize(256),
@@ -368,18 +338,24 @@ def get_data(args):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
         
-        train_dataset = ArrowImageNetDataset(train_files, train_transform)
-        val_dataset = ArrowImageNetDataset(val_files, val_transform)
-    
+        # Create datasets
+        train_dataset = HFImageNetDataset(dataset['train'], train_transform)
+        
+        # Handle validation split naming
+        val_split = 'validation' if 'validation' in dataset else 'test'
+        val_dataset = HFImageNetDataset(dataset[val_split], val_transform)
+        
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
 
+    # Create samplers for distributed training
     train_sampler = None
     val_sampler = None
     if args.distributed:
         train_sampler = distributed.DistributedSampler(train_dataset)
         val_sampler = distributed.DistributedSampler(val_dataset, shuffle=False)
 
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -387,8 +363,8 @@ def get_data(args):
         num_workers=args.workers,
         pin_memory=True,
         sampler=train_sampler,
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=2,        # Prefetch batches for better performance
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     val_loader = DataLoader(
