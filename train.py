@@ -272,68 +272,68 @@ def get_data(args):
         import pyarrow as pa
         from torch.utils.data import Dataset
         
-        class RobustArrowDataset(Dataset):
-            def __init__(self, arrow_files, transform=None, max_samples=None):
+        class LazyArrowDataset(Dataset):
+            def __init__(self, arrow_files, transform=None):
                 self.transform = transform
-                self.data = []
+                self.arrow_files = arrow_files
+                self.file_tables = {}  # Cache for loaded tables
+                self.sample_indices = []  # (file_idx, sample_idx) mapping
                 
-                print(f"Loading {len(arrow_files)} Arrow files...")
-                loaded_files = 0
+                print(f"Indexing {len(arrow_files)} Arrow files...")
                 
-                for file_path in arrow_files:
+                # Build index without loading all data
+                for file_idx, file_path in enumerate(arrow_files):
                     try:
-                        # Try different Arrow loading methods
-                        table = None
-                        
-                        # Method 1: Memory map
-                        try:
-                            with pa.memory_map(file_path, 'r') as source:
-                                table = pa.ipc.open_file(source).read_all()
-                        except:
-                            # Method 2: Regular file read
-                            try:
-                                with open(file_path, 'rb') as f:
-                                    table = pa.ipc.open_file(f).read_all()
-                            except:
-                                # Method 3: RecordBatch reader
-                                try:
-                                    with pa.memory_map(file_path, 'r') as source:
-                                        reader = pa.ipc.open_stream(source)
-                                        batches = []
-                                        for batch in reader:
-                                            batches.append(batch)
-                                        table = pa.Table.from_batches(batches)
-                                except:
-                                    print(f"⚠️ Failed to load {os.path.basename(file_path)}")
-                                    continue
-                        
-                        if table is not None:
-                            # Convert to list of dicts
-                            data_list = table.to_pylist()
-                            self.data.extend(data_list)
-                            loaded_files += 1
-                            print(f"✅ Loaded {os.path.basename(file_path)}: {len(data_list)} samples")
+                        # Just get the table size, don't load data
+                        with pa.memory_map(file_path, 'r') as source:
+                            table = pa.ipc.open_file(source).read_all()
+                            num_samples = len(table)
                             
-                            if max_samples and len(self.data) >= max_samples:
-                                self.data = self.data[:max_samples]
-                                break
-                                
+                            # Add indices for this file
+                            for sample_idx in range(num_samples):
+                                self.sample_indices.append((file_idx, sample_idx))
+                            
+                            print(f"✅ Indexed {os.path.basename(file_path)}: {num_samples} samples")
+                            
                     except Exception as e:
-                        print(f"❌ Error loading {os.path.basename(file_path)}: {e}")
+                        print(f"❌ Failed to index {os.path.basename(file_path)}: {e}")
                         continue
                 
-                print(f"Successfully loaded {loaded_files}/{len(arrow_files)} files")
-                print(f"Total samples: {len(self.data)}")
+                print(f"Total indexed samples: {len(self.sample_indices)}")
                 
-                if len(self.data) == 0:
-                    raise ValueError("No data loaded! All Arrow files failed.")
+                if len(self.sample_indices) == 0:
+                    raise ValueError("No samples indexed! All Arrow files failed.")
+            
+            def _load_table(self, file_idx):
+                """Lazy load and cache table"""
+                if file_idx not in self.file_tables:
+                    file_path = self.arrow_files[file_idx]
+                    try:
+                        with pa.memory_map(file_path, 'r') as source:
+                            table = pa.ipc.open_file(source).read_all()
+                            self.file_tables[file_idx] = table.to_pylist()
+                    except Exception as e:
+                        print(f"Error loading {os.path.basename(file_path)}: {e}")
+                        return None
+                return self.file_tables[file_idx]
             
             def __len__(self):
-                return len(self.data)
+                return len(self.sample_indices)
             
             def __getitem__(self, idx):
+                file_idx, sample_idx = self.sample_indices[idx]
+                
+                # Lazy load the table if needed
+                table_data = self._load_table(file_idx)
+                if table_data is None:
+                    # Return dummy sample
+                    dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
+                    if self.transform:
+                        dummy = self.transform(dummy)
+                    return dummy, 0
+                
                 try:
-                    sample = self.data[idx]
+                    sample = table_data[sample_idx]
                     image = sample['image']
                     label = sample['label']
                     
@@ -344,7 +344,6 @@ def get_data(args):
                         elif 'path' in image:
                             image = Image.open(image['path'])
                         else:
-                            # Create RGB placeholder
                             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     elif hasattr(image, 'convert'):  # PIL Image
                         pass
@@ -364,7 +363,6 @@ def get_data(args):
                     
                 except Exception as e:
                     print(f"Error in sample {idx}: {e}")
-                    # Return dummy
                     dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     if self.transform:
                         dummy = self.transform(dummy)
@@ -404,8 +402,8 @@ def get_data(args):
         ])
         
         # Create datasets
-        train_dataset = RobustArrowDataset(train_files, train_transform)
-        val_dataset = RobustArrowDataset(val_files, val_transform)
+        train_dataset = LazyArrowDataset(train_files, train_transform)
+        val_dataset = LazyArrowDataset(val_files, val_transform)
         
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
