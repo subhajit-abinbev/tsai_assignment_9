@@ -16,6 +16,8 @@ import boto3
 from PIL import Image
 import io
 from datasets import load_from_disk
+# Add these imports
+import pyarrow as pa
 
 # ==========================================================
 # 0. S3 Utilities
@@ -240,6 +242,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def get_data(args):
     """Return train and val loaders for CIFAR100, ImageNet-100, or ImageNet."""
     if args.dataset.lower() == "cifar100":
+        # ... keep existing CIFAR100 code ...
         num_classes = 100
         # CIFAR-100 specific transforms (32x32 images)
         train_transform = transforms.Compose([
@@ -265,71 +268,133 @@ def get_data(args):
             root=args.data_dir, train=False, download=True, transform=val_transform
         )
     elif args.dataset.lower() in ["imagenet100", "imagenet"]:
-        # Use HuggingFace datasets directly
-        from datasets import load_from_disk
+        # Robust Arrow file loading approach
+        import pyarrow as pa
         from torch.utils.data import Dataset
         
-        class HFImageNetDataset(Dataset):
-            def __init__(self, hf_dataset, transform=None):
-                self.hf_dataset = hf_dataset
+        class RobustArrowDataset(Dataset):
+            def __init__(self, arrow_files, transform=None, max_samples=None):
                 self.transform = transform
-                print(f"Dataset loaded with {len(self.hf_dataset)} samples")
+                self.data = []
+                
+                print(f"Loading {len(arrow_files)} Arrow files...")
+                loaded_files = 0
+                
+                for file_path in arrow_files:
+                    try:
+                        # Try different Arrow loading methods
+                        table = None
+                        
+                        # Method 1: Memory map
+                        try:
+                            with pa.memory_map(file_path, 'r') as source:
+                                table = pa.ipc.open_file(source).read_all()
+                        except:
+                            # Method 2: Regular file read
+                            try:
+                                with open(file_path, 'rb') as f:
+                                    table = pa.ipc.open_file(f).read_all()
+                            except:
+                                # Method 3: RecordBatch reader
+                                try:
+                                    with pa.memory_map(file_path, 'r') as source:
+                                        reader = pa.ipc.open_stream(source)
+                                        batches = []
+                                        for batch in reader:
+                                            batches.append(batch)
+                                        table = pa.Table.from_batches(batches)
+                                except:
+                                    print(f"⚠️ Failed to load {os.path.basename(file_path)}")
+                                    continue
+                        
+                        if table is not None:
+                            # Convert to list of dicts
+                            data_list = table.to_pylist()
+                            self.data.extend(data_list)
+                            loaded_files += 1
+                            print(f"✅ Loaded {os.path.basename(file_path)}: {len(data_list)} samples")
+                            
+                            if max_samples and len(self.data) >= max_samples:
+                                self.data = self.data[:max_samples]
+                                break
+                                
+                    except Exception as e:
+                        print(f"❌ Error loading {os.path.basename(file_path)}: {e}")
+                        continue
+                
+                print(f"Successfully loaded {loaded_files}/{len(arrow_files)} files")
+                print(f"Total samples: {len(self.data)}")
+                
+                if len(self.data) == 0:
+                    raise ValueError("No data loaded! All Arrow files failed.")
             
             def __len__(self):
-                return len(self.hf_dataset)
+                return len(self.data)
             
             def __getitem__(self, idx):
                 try:
-                    sample = self.hf_dataset[idx]
-                    
-                    # Get image and label
+                    sample = self.data[idx]
                     image = sample['image']
                     label = sample['label']
                     
-                    # Handle PIL Image (most common case for HF datasets)
-                    if hasattr(image, 'convert'):
-                        if image.mode != 'RGB':
-                            image = image.convert('RGB')
-                    else:
-                        # Handle other formats
-                        if isinstance(image, dict) and 'bytes' in image:
-                            import io
+                    # Handle different image formats
+                    if isinstance(image, dict):
+                        if 'bytes' in image:
                             image = Image.open(io.BytesIO(image['bytes']))
-                        elif hasattr(image, 'shape'):  # NumPy array
-                            image = Image.fromarray(image)
+                        elif 'path' in image:
+                            image = Image.open(image['path'])
                         else:
-                            # Fallback: create dummy image
+                            # Create RGB placeholder
                             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                        
-                        if image.mode != 'RGB':
-                            image = image.convert('RGB')
+                    elif hasattr(image, 'convert'):  # PIL Image
+                        pass
+                    elif hasattr(image, 'shape'):  # NumPy
+                        image = Image.fromarray(image)
+                    else:
+                        image = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     
-                    # Apply transforms
+                    # Ensure RGB
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
                     if self.transform:
                         image = self.transform(image)
                     
                     return image, label
                     
                 except Exception as e:
-                    print(f"Error loading sample {idx}: {e}")
-                    # Return dummy sample
+                    print(f"Error in sample {idx}: {e}")
+                    # Return dummy
                     dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     if self.transform:
                         dummy = self.transform(dummy)
                     return dummy, 0
         
-        # Load dataset using HuggingFace
-        print(f"Loading HuggingFace dataset from: {args.data_dir}")
-        try:
-            dataset = load_from_disk(args.data_dir)
-            print(f"✅ Dataset loaded successfully!")
-            print(f"Available splits: {list(dataset.keys())}")
-        except Exception as e:
-            raise ValueError(f"Failed to load dataset: {e}")
+        # Find Arrow files
+        arrow_files = []
+        for root, dirs, files in os.walk(args.data_dir):
+            for file in files:
+                if file.endswith('.arrow'):
+                    arrow_files.append(os.path.join(root, file))
+        
+        print(f"Found {len(arrow_files)} Arrow files in {args.data_dir}")
+        
+        if not arrow_files:
+            raise ValueError(f"No Arrow files found in {args.data_dir}")
+        
+        # Separate train/validation files
+        train_files = [f for f in arrow_files if 'train' in os.path.basename(f)]
+        val_files = [f for f in arrow_files if any(x in os.path.basename(f) for x in ['validation', 'test'])]
+        
+        print(f"Train files: {len(train_files)}")
+        print(f"Validation files: {len(val_files)}")
+        
+        if not train_files or not val_files:
+            raise ValueError("Missing train or validation Arrow files")
         
         num_classes = 1000 if args.dataset.lower() == "imagenet" else 100
         
-        # Define transforms
+        # Transforms
         train_transform = get_strong_transforms()
         val_transform = transforms.Compose([
             transforms.Resize(256),
@@ -339,11 +404,8 @@ def get_data(args):
         ])
         
         # Create datasets
-        train_dataset = HFImageNetDataset(dataset['train'], train_transform)
-        
-        # Handle validation split naming
-        val_split = 'validation' if 'validation' in dataset else 'test'
-        val_dataset = HFImageNetDataset(dataset[val_split], val_transform)
+        train_dataset = RobustArrowDataset(train_files, train_transform)
+        val_dataset = RobustArrowDataset(val_files, val_transform)
         
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
