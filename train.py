@@ -444,6 +444,9 @@ def train(rank, world_size, args):
         torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
+    # Initialize writer early to avoid UnboundLocalError
+    writer = SummaryWriter(args.log_dir) if rank == 0 else None
+
     try:
         # ===============================
         # 1. Data
