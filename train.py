@@ -14,6 +14,7 @@ from tqdm import tqdm
 import numpy as np
 import boto3
 from botocore.exceptions import ClientError
+from datasets import load_from_disk
 
 # ==========================================================
 # 0. S3 Utilities
@@ -262,42 +263,45 @@ def get_data(args):
         val_dataset = datasets.CIFAR100(
             root=args.data_dir, train=False, download=True, transform=val_transform
         )
-    elif args.dataset.lower() == "imagenet100":
-        num_classes = 100
-        train_dir = os.path.join(args.data_dir, "train")
-        val_dir = os.path.join(args.data_dir, "val")
-
-        train_transform = get_strong_transforms()  # Use enhanced transforms
+    elif args.dataset.lower() in ["imagenet100", "imagenet"]:
+        # Use HuggingFace dataset
+        from torch.utils.data import Dataset
+        
+        class HFImageNetDataset(Dataset):
+            def __init__(self, hf_dataset, transform=None):
+                self.dataset = hf_dataset
+                self.transform = transform
+            
+            def __len__(self):
+                return len(self.dataset)
+            
+            def __getitem__(self, idx):
+                sample = self.dataset[idx]
+                image = sample['image']
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                label = sample['label']
+                
+                if self.transform:
+                    image = self.transform(image)
+                return image, label
+        
+        print(f"Loading HuggingFace dataset from: {args.data_dir}")
+        dataset = load_from_disk(args.data_dir)
+        
+        num_classes = 1000 if args.dataset.lower() == "imagenet" else 100
+        
+        train_transform = get_strong_transforms()
         val_transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
-
-        train_dataset = datasets.ImageFolder(train_dir, transform=train_transform)
-        val_dataset = datasets.ImageFolder(val_dir, transform=val_transform)
-    elif args.dataset.lower() == "imagenet":
-        num_classes = 1000
-        train_dir = os.path.join(args.data_dir, "train")
-        val_dir = os.path.join(args.data_dir, "val")
-
-        train_transform = get_strong_transforms()  # Use enhanced transforms
-        val_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-        ])
-
-        train_dataset = datasets.ImageFolder(train_dir, transform=train_transform)
-        val_dataset = datasets.ImageFolder(val_dir, transform=val_transform)
+        
+        train_dataset = HFImageNetDataset(dataset['train'], train_transform)
+        val_split = 'validation' if 'validation' in dataset else 'val'
+        val_dataset = HFImageNetDataset(dataset[val_split], val_transform)
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
 
