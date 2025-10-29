@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
 import boto3
-from botocore.exceptions import ClientErrorload_from_disk
 import pyarrow as pa
 from PIL import Image
 import io
