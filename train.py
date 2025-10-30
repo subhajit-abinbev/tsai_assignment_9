@@ -241,7 +241,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 def get_data(args):
     """Return train and val loaders for CIFAR100, ImageNet-100, or ImageNet.
-    This version *requires* dataset_info.json (or equivalent data_files/splits entries)
+    This version *requires* dataset_info.json (or equivalent data_files / download_checksums)
     to determine which arrow shards belong to train/val/test. No heuristic splits.
     """
     import os
@@ -251,9 +251,11 @@ def get_data(args):
     import pyarrow as pa
     from torch.utils.data import Dataset, DataLoader
     import torchvision.transforms as transforms
+    from torchvision import datasets  # uses your top-level import
+    import torch
 
+    # CIFAR100 branch unchanged
     if args.dataset.lower() == "cifar100":
-        # existing CIFAR100 code (unchanged)
         num_classes = 100
         train_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -261,14 +263,14 @@ def get_data(args):
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.5071, 0.4865, 0.4409],
-                std=[0.2673, 0.2564, 0.2762]
+                std=[0.2673, 0.2563, 0.2762]
             ),
         ])
         val_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.5071, 0.4865, 0.4409],
-                std=[0.2673, 0.2564, 0.2762]
+                std=[0.2673, 0.2563, 0.2762]
             ),
         ])
         train_dataset = datasets.CIFAR100(
@@ -277,27 +279,23 @@ def get_data(args):
         val_dataset = datasets.CIFAR100(
             root=args.data_dir, train=False, download=True, transform=val_transform
         )
+
     elif args.dataset.lower() in ["imagenet100", "imagenet"]:
         # ---------- LazyArrowDataset (memory-efficient) ----------
         class LazyArrowDataset(Dataset):
             def __init__(self, arrow_files, transform=None):
                 self.transform = transform
-                # keep absolute paths for files
                 self.arrow_files = list(arrow_files)
-                self.file_tables = {}  # Cache for loaded pyarrow tables
+                self.file_tables = {}  # Cache loaded pyarrow.Table objects
                 self.sample_index = []  # list of (file_idx, sample_idx)
                 print(f"Indexing {len(self.arrow_files)} Arrow files...")
 
-                # Build index (use number of rows in each arrow file)
                 for file_idx, file_path in enumerate(self.arrow_files):
                     try:
                         with pa.memory_map(file_path, 'r') as source:
                             reader = pa.ipc.open_file(source)
-                            num_rows = reader.num_record_batches * 0  # fallback, will read_table below
-                            # read only schema + length (read_table is ok for length query)
                             table = reader.read_all()
                             num_rows = len(table)
-                            # add indices
                             self.sample_index.extend([(file_idx, i) for i in range(num_rows)])
                             print(f"✅ Indexed {os.path.basename(file_path)}: {num_rows} samples")
                     except Exception as e:
@@ -309,7 +307,6 @@ def get_data(args):
                     raise ValueError("No samples indexed! All Arrow files failed.")
 
             def _load_table(self, file_idx):
-                """Load and cache a pyarrow.Table (not converting to_pylist to save memory)."""
                 if file_idx not in self.file_tables:
                     file_path = self.arrow_files[file_idx]
                     try:
@@ -331,10 +328,8 @@ def get_data(args):
                     dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     return (self.transform(dummy), 0) if self.transform else (dummy, 0)
                 try:
-                    # fetch row as pydict without converting entire table
-                    # Using slice + to_pydict for single row to avoid full to_pylist
+                    # slice a single row and convert to pydict (minimal overhead)
                     row = table.slice(sample_idx, 1).to_pydict()
-                    # row columns are list of length 1; extract value[0]
                     image_field = row.get('image')
                     label_field = row.get('label')
 
@@ -344,7 +339,7 @@ def get_data(args):
                     image = image_field[0]
                     label = label_field[0]
 
-                    # Handle common representations
+                    # handle various image representations
                     if isinstance(image, dict):
                         if 'bytes' in image:
                             image = Image.open(io.BytesIO(image['bytes']))
@@ -353,13 +348,12 @@ def get_data(args):
                         else:
                             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
                     elif hasattr(image, 'convert'):
-                        # likely a PIL image already
+                        # likely a PIL Image already
                         pass
                     elif hasattr(image, 'shape'):
                         # numpy array
                         image = Image.fromarray(image)
                     else:
-                        # fallback
                         image = Image.new('RGB', (224, 224), color=(128, 128, 128))
 
                     if image.mode != 'RGB':
@@ -388,7 +382,6 @@ def get_data(args):
         # ---------- parse dataset_info.json (required) ----------
         info_path = os.path.join(args.data_dir, "dataset_info.json")
         if not os.path.exists(info_path):
-            # try alternative name dataset_infos.json
             alt = os.path.join(args.data_dir, "dataset_infos.json")
             if os.path.exists(alt):
                 info_path = alt
@@ -399,93 +392,125 @@ def get_data(args):
         with open(info_path, 'r') as f:
             info = json.load(f)
 
-        # Utility to normalize basenames from arrow_files
+        # map basenames -> full local path for quick lookup
         arrow_basenames = {os.path.basename(p): p for p in arrow_files}
 
         train_files = []
         val_files = []
         test_files = []
 
-        # 1) common HF layout: top-level "data_files" (dict or list)
-        if isinstance(info.get('data_files'), dict):
-            df = info['data_files']
-            # check common keys
-            if 'train' in df:
-                train_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['train']]
-                train_files = [p for p in train_files if p]
-            if 'validation' in df:
-                val_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['validation']]
-                val_files = [p for p in val_files if p]
-            if 'test' in df:
-                test_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['test']]
-                test_files = [p for p in test_files if p]
-        elif isinstance(info.get('data_files'), list):
-            # if it's a flat list, try to infer by filenames containing 'train' or 'validation'
-            for p in info['data_files']:
-                b = os.path.basename(p)
-                full = arrow_basenames.get(b)
-                if not full:
-                    continue
-                if 'train' in b.lower():
-                    train_files.append(full)
-                elif 'val' in b.lower() or 'validation' in b.lower() or 'test' in b.lower():
-                    val_files.append(full)
-                else:
-                    # unknown placement - keep in train by default? here we choose to error
-                    pass
+        # helper to try several candidate basename transformations and match to arrow_basenames
+        def find_local_path_for_hf_entry(hf_entry):
+            # hf_entry examples: ".../data/train-00000-of-00294.parquet"
+            b = os.path.basename(hf_entry)
+            candidates = set()
+            candidates.add(b)
+            # common parquet -> arrow replacement
+            if b.endswith(".parquet"):
+                candidates.add(b.replace(".parquet", ".arrow"))
+            # sometimes HF uses 'train-' names while local arrow uses 'data-'
+            candidates.add(b.replace("train-", "data-").replace(".parquet", ".arrow"))
+            candidates.add(b.replace("validation-", "data-").replace(".parquet", ".arrow"))
+            candidates.add(b.replace("val-", "data-").replace(".parquet", ".arrow"))
+            # also try removing split prefix entirely (train- -> '')
+            if "train-" in b:
+                candidates.add(b.replace("train-", ""))
+            if "validation-" in b:
+                candidates.add(b.replace("validation-", ""))
+            # finally try only the numeric suffix part (e.g., keep '-00000-of-00294.arrow')
+            for c in list(candidates):
+                if "-of-" in c:
+                    parts = c.split("-", 1)
+                    candidates.add(parts[1] if len(parts) == 2 else c)
+            # check arrow_basenames for any candidate
+            for cand in candidates:
+                if cand in arrow_basenames:
+                    return arrow_basenames[cand]
+            return None
 
-        # 2) fallback: "splits" with files/filenames inside each split object
+        # 1) Prefer 'data_files' structure (dict or list)
+        df = info.get('data_files')
+        if isinstance(df, dict):
+            # typical HF: {'train': [...], 'validation': [...], ...}
+            for split_key, hf_list in df.items():
+                if not isinstance(hf_list, list):
+                    continue
+                local_list = []
+                for entry in hf_list:
+                    lp = find_local_path_for_hf_entry(entry)
+                    if lp:
+                        local_list.append(lp)
+                nname = split_key.lower()
+                if 'train' in nname:
+                    train_files = sorted(set(local_list))
+                elif 'valid' in nname or 'val' in nname:
+                    val_files = sorted(set(local_list))
+                elif 'test' in nname:
+                    test_files = sorted(set(local_list))
+
+        elif isinstance(df, list):
+            # flat list: classify by substring in filename
+            for entry in df:
+                lp = find_local_path_for_hf_entry(entry)
+                if not lp:
+                    continue
+                b = os.path.basename(entry).lower()
+                if 'train' in b:
+                    train_files.append(lp)
+                elif 'val' in b or 'validation' in b:
+                    val_files.append(lp)
+                elif 'test' in b:
+                    test_files.append(lp)
+
+        # 2) fallback: download_checksums keys (many HF dataset_info.json use this)
+        if not (train_files and val_files) and 'download_checksums' in info:
+            for entry in info['download_checksums'].keys():
+                lp = find_local_path_for_hf_entry(entry)
+                if not lp:
+                    continue
+                b = os.path.basename(entry).lower()
+                if 'train' in b:
+                    train_files.append(lp)
+                elif 'val' in b or 'validation' in b:
+                    val_files.append(lp)
+                elif 'test' in b:
+                    test_files.append(lp)
+
+        # 3) fallback: 'splits' metadata inside dataset_info
         if not (train_files and val_files):
             splits = info.get('splits') or info.get('split') or {}
             if isinstance(splits, dict):
                 for split_name, split_meta in splits.items():
-                    # locate file lists in split_meta
-                    possible_lists = []
-                    if isinstance(split_meta, dict):
-                        for key in ('files', 'filenames', 'files_list', 'data_files'):
-                            if key in split_meta and isinstance(split_meta[key], list):
-                                possible_lists.append(split_meta[key])
-                        # sometimes HF stores a "file" key with a single filename string
-                        for key in ('file', 'filename'):
-                            if key in split_meta and isinstance(split_meta[key], str):
-                                possible_lists.append([split_meta[key]])
-                    # flatten and map to disk files
-                    flat = []
-                    for lst in possible_lists:
-                        for entry in lst:
-                            b = os.path.basename(entry)
-                            if b in arrow_basenames:
-                                flat.append(arrow_basenames[b])
-                    if flat:
+                    if not isinstance(split_meta, dict):
+                        continue
+                    # try multiple keys that might hold filenames
+                    possible_entries = []
+                    for key in ('files','filenames','data_files','file','filename','files_list'):
+                        v = split_meta.get(key)
+                        if isinstance(v, list):
+                            possible_entries.extend(v)
+                        elif isinstance(v, str):
+                            possible_entries.append(v)
+                    # map them to local arrow files
+                    local_list = []
+                    for entry in possible_entries:
+                        lp = find_local_path_for_hf_entry(entry)
+                        if lp:
+                            local_list.append(lp)
+                    if local_list:
                         nname = split_name.lower()
                         if 'train' in nname and not train_files:
-                            train_files = sorted(set(flat))
-                        elif ('valid' in nname or 'val' in nname) and not val_files:
-                            val_files = sorted(set(flat))
+                            train_files = sorted(set(local_list))
+                        elif ('val' in nname or 'valid' in nname) and not val_files:
+                            val_files = sorted(set(local_list))
                         elif 'test' in nname and not test_files:
-                            test_files = sorted(set(flat))
+                            test_files = sorted(set(local_list))
 
-        # If still empty for train/val, attempt top-level 'files' list
-        if not (train_files and val_files):
-            maybe_files = info.get('files') or info.get('file_list')
-            if isinstance(maybe_files, list):
-                for entry in maybe_files:
-                    b = os.path.basename(entry)
-                    full = arrow_basenames.get(b)
-                    if not full:
-                        continue
-                    if 'train' in b.lower():
-                        train_files.append(full)
-                    elif 'val' in b.lower() or 'validation' in b.lower():
-                        val_files.append(full)
-                    elif 'test' in b.lower():
-                        test_files.append(full)
-
-        # Final sanity: if train_files or val_files are still empty, fail loudly
+        # Final sanity — do not do heuristics. If mapping failed, raise.
         if not train_files or not val_files:
             raise ValueError(
                 "Could not map train/validation shards from dataset_info.json. "
-                "Make sure dataset_info.json contains 'data_files' or 'splits' with explicit file lists or filenames. "
+                "Make sure dataset_info.json contains 'data_files', 'download_checksums' or 'splits' with explicit file lists or filenames. "
                 f"Found {len(arrow_files)} arrow files on disk. Parsed train_files={len(train_files)}, val_files={len(val_files)}."
             )
 
@@ -493,7 +518,15 @@ def get_data(args):
 
         num_classes = 1000 if args.dataset.lower() == "imagenet" else 100
 
-        # Transforms
+        # transforms
+        def get_strong_transforms():
+            return transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.RandomErasing(p=0.25),
+                transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+            ])
         train_transform = get_strong_transforms()
         val_transform = transforms.Compose([
             transforms.Resize(256),
@@ -502,20 +535,21 @@ def get_data(args):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 
-        # Create datasets
         train_dataset = LazyArrowDataset(train_files, train_transform)
         val_dataset = LazyArrowDataset(val_files, val_transform)
+
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
 
-    # Create samplers for distributed training
+    # distributed samplers if needed (uses `distributed` imported at top of your file)
     train_sampler = None
     val_sampler = None
-    if args.distributed:
-        train_sampler = distributed.DistributedSampler(train_dataset)
-        val_sampler = distributed.DistributedSampler(val_dataset, shuffle=False)
+    if getattr(args, "distributed", False):
+        from torch.utils.data import distributed as _distributed
+        train_sampler = _distributed.DistributedSampler(train_dataset)
+        val_sampler = _distributed.DistributedSampler(val_dataset, shuffle=False)
 
-    # Create data loaders
+    # DataLoaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
