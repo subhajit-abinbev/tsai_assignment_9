@@ -240,17 +240,27 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 
 def get_data(args):
-    """Return train and val loaders for CIFAR100, ImageNet-100, or ImageNet."""
+    """Return train and val loaders for CIFAR100, ImageNet-100, or ImageNet.
+    This version *requires* dataset_info.json (or equivalent data_files/splits entries)
+    to determine which arrow shards belong to train/val/test. No heuristic splits.
+    """
+    import os
+    import io
+    import json
+    from PIL import Image
+    import pyarrow as pa
+    from torch.utils.data import Dataset, DataLoader
+    import torchvision.transforms as transforms
+
     if args.dataset.lower() == "cifar100":
-        # ... keep existing CIFAR100 code ...
+        # existing CIFAR100 code (unchanged)
         num_classes = 100
-        # CIFAR-100 specific transforms (32x32 images)
         train_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=[0.5071, 0.4865, 0.4409],  # CIFAR-100 specific stats
+                mean=[0.5071, 0.4865, 0.4409],
                 std=[0.2673, 0.2564, 0.2762]
             ),
         ])
@@ -268,76 +278,73 @@ def get_data(args):
             root=args.data_dir, train=False, download=True, transform=val_transform
         )
     elif args.dataset.lower() in ["imagenet100", "imagenet"]:
-        # Robust Arrow file loading approach
-        import pyarrow as pa
-        from torch.utils.data import Dataset
-        
+        # ---------- LazyArrowDataset (memory-efficient) ----------
         class LazyArrowDataset(Dataset):
             def __init__(self, arrow_files, transform=None):
                 self.transform = transform
-                self.arrow_files = arrow_files
-                self.file_tables = {}  # Cache for loaded tables
-                self.sample_indices = []  # (file_idx, sample_idx) mapping
-                
-                print(f"Indexing {len(arrow_files)} Arrow files...")
-                
-                # Build index without loading all data
-                for file_idx, file_path in enumerate(arrow_files):
+                # keep absolute paths for files
+                self.arrow_files = list(arrow_files)
+                self.file_tables = {}  # Cache for loaded pyarrow tables
+                self.sample_index = []  # list of (file_idx, sample_idx)
+                print(f"Indexing {len(self.arrow_files)} Arrow files...")
+
+                # Build index (use number of rows in each arrow file)
+                for file_idx, file_path in enumerate(self.arrow_files):
                     try:
-                        # Just get the table size, don't load data
                         with pa.memory_map(file_path, 'r') as source:
-                            table = pa.ipc.open_file(source).read_all()
-                            num_samples = len(table)
-                            
-                            # Add indices for this file
-                            for sample_idx in range(num_samples):
-                                self.sample_indices.append((file_idx, sample_idx))
-                            
-                            print(f"✅ Indexed {os.path.basename(file_path)}: {num_samples} samples")
-                            
+                            reader = pa.ipc.open_file(source)
+                            num_rows = reader.num_record_batches * 0  # fallback, will read_table below
+                            # read only schema + length (read_table is ok for length query)
+                            table = reader.read_all()
+                            num_rows = len(table)
+                            # add indices
+                            self.sample_index.extend([(file_idx, i) for i in range(num_rows)])
+                            print(f"✅ Indexed {os.path.basename(file_path)}: {num_rows} samples")
                     except Exception as e:
                         print(f"❌ Failed to index {os.path.basename(file_path)}: {e}")
                         continue
-                
-                print(f"Total indexed samples: {len(self.sample_indices)}")
-                
-                if len(self.sample_indices) == 0:
+
+                print(f"Total indexed samples: {len(self.sample_index)}")
+                if len(self.sample_index) == 0:
                     raise ValueError("No samples indexed! All Arrow files failed.")
-            
+
             def _load_table(self, file_idx):
-                """Lazy load and cache table"""
+                """Load and cache a pyarrow.Table (not converting to_pylist to save memory)."""
                 if file_idx not in self.file_tables:
                     file_path = self.arrow_files[file_idx]
                     try:
                         with pa.memory_map(file_path, 'r') as source:
                             table = pa.ipc.open_file(source).read_all()
-                            self.file_tables[file_idx] = table.to_pylist()
+                            self.file_tables[file_idx] = table
                     except Exception as e:
                         print(f"Error loading {os.path.basename(file_path)}: {e}")
                         return None
                 return self.file_tables[file_idx]
-            
+
             def __len__(self):
-                return len(self.sample_indices)
-            
+                return len(self.sample_index)
+
             def __getitem__(self, idx):
-                file_idx, sample_idx = self.sample_indices[idx]
-                
-                # Lazy load the table if needed
-                table_data = self._load_table(file_idx)
-                if table_data is None:
-                    # Return dummy sample
+                file_idx, sample_idx = self.sample_index[idx]
+                table = self._load_table(file_idx)
+                if table is None:
                     dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    if self.transform:
-                        dummy = self.transform(dummy)
-                    return dummy, 0
-                
+                    return (self.transform(dummy), 0) if self.transform else (dummy, 0)
                 try:
-                    sample = table_data[sample_idx]
-                    image = sample['image']
-                    label = sample['label']
-                    
-                    # Handle different image formats
+                    # fetch row as pydict without converting entire table
+                    # Using slice + to_pydict for single row to avoid full to_pylist
+                    row = table.slice(sample_idx, 1).to_pydict()
+                    # row columns are list of length 1; extract value[0]
+                    image_field = row.get('image')
+                    label_field = row.get('label')
+
+                    if image_field is None or label_field is None:
+                        raise KeyError("Missing 'image' or 'label' column in arrow.")
+
+                    image = image_field[0]
+                    label = label_field[0]
+
+                    # Handle common representations
                     if isinstance(image, dict):
                         if 'bytes' in image:
                             image = Image.open(io.BytesIO(image['bytes']))
@@ -345,53 +352,147 @@ def get_data(args):
                             image = Image.open(image['path'])
                         else:
                             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    elif hasattr(image, 'convert'):  # PIL Image
+                    elif hasattr(image, 'convert'):
+                        # likely a PIL image already
                         pass
-                    elif hasattr(image, 'shape'):  # NumPy
+                    elif hasattr(image, 'shape'):
+                        # numpy array
                         image = Image.fromarray(image)
                     else:
+                        # fallback
                         image = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    
-                    # Ensure RGB
+
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
-                    
+
                     if self.transform:
                         image = self.transform(image)
-                    
-                    return image, label
-                    
+
+                    return image, int(label)
                 except Exception as e:
-                    print(f"Error in sample {idx}: {e}")
+                    print(f"Error reading sample idx {idx} (file_idx {file_idx}): {e}")
                     dummy = Image.new('RGB', (224, 224), color=(128, 128, 128))
-                    if self.transform:
-                        dummy = self.transform(dummy)
-                    return dummy, 0
-        
-        # Find Arrow files
+                    return (self.transform(dummy), 0) if self.transform else (dummy, 0)
+
+        # ---------- collect arrow files present on disk ----------
         arrow_files = []
         for root, dirs, files in os.walk(args.data_dir):
             for file in files:
                 if file.endswith('.arrow'):
                     arrow_files.append(os.path.join(root, file))
-        
+        arrow_files = sorted(arrow_files)
         print(f"Found {len(arrow_files)} Arrow files in {args.data_dir}")
-        
         if not arrow_files:
             raise ValueError(f"No Arrow files found in {args.data_dir}")
-        
-        # Separate train/validation files
-        train_files = [f for f in arrow_files if 'train' in os.path.basename(f)]
-        val_files = [f for f in arrow_files if any(x in os.path.basename(f) for x in ['validation', 'test'])]
-        
-        print(f"Train files: {len(train_files)}")
-        print(f"Validation files: {len(val_files)}")
-        
+
+        # ---------- parse dataset_info.json (required) ----------
+        info_path = os.path.join(args.data_dir, "dataset_info.json")
+        if not os.path.exists(info_path):
+            # try alternative name dataset_infos.json
+            alt = os.path.join(args.data_dir, "dataset_infos.json")
+            if os.path.exists(alt):
+                info_path = alt
+
+        if not os.path.exists(info_path):
+            raise ValueError(f"dataset_info.json not found under {args.data_dir}. This function requires it to map shards to splits.")
+
+        with open(info_path, 'r') as f:
+            info = json.load(f)
+
+        # Utility to normalize basenames from arrow_files
+        arrow_basenames = {os.path.basename(p): p for p in arrow_files}
+
+        train_files = []
+        val_files = []
+        test_files = []
+
+        # 1) common HF layout: top-level "data_files" (dict or list)
+        if isinstance(info.get('data_files'), dict):
+            df = info['data_files']
+            # check common keys
+            if 'train' in df:
+                train_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['train']]
+                train_files = [p for p in train_files if p]
+            if 'validation' in df:
+                val_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['validation']]
+                val_files = [p for p in val_files if p]
+            if 'test' in df:
+                test_files = [arrow_basenames.get(os.path.basename(p), None) for p in df['test']]
+                test_files = [p for p in test_files if p]
+        elif isinstance(info.get('data_files'), list):
+            # if it's a flat list, try to infer by filenames containing 'train' or 'validation'
+            for p in info['data_files']:
+                b = os.path.basename(p)
+                full = arrow_basenames.get(b)
+                if not full:
+                    continue
+                if 'train' in b.lower():
+                    train_files.append(full)
+                elif 'val' in b.lower() or 'validation' in b.lower() or 'test' in b.lower():
+                    val_files.append(full)
+                else:
+                    # unknown placement - keep in train by default? here we choose to error
+                    pass
+
+        # 2) fallback: "splits" with files/filenames inside each split object
+        if not (train_files and val_files):
+            splits = info.get('splits') or info.get('split') or {}
+            if isinstance(splits, dict):
+                for split_name, split_meta in splits.items():
+                    # locate file lists in split_meta
+                    possible_lists = []
+                    if isinstance(split_meta, dict):
+                        for key in ('files', 'filenames', 'files_list', 'data_files'):
+                            if key in split_meta and isinstance(split_meta[key], list):
+                                possible_lists.append(split_meta[key])
+                        # sometimes HF stores a "file" key with a single filename string
+                        for key in ('file', 'filename'):
+                            if key in split_meta and isinstance(split_meta[key], str):
+                                possible_lists.append([split_meta[key]])
+                    # flatten and map to disk files
+                    flat = []
+                    for lst in possible_lists:
+                        for entry in lst:
+                            b = os.path.basename(entry)
+                            if b in arrow_basenames:
+                                flat.append(arrow_basenames[b])
+                    if flat:
+                        nname = split_name.lower()
+                        if 'train' in nname and not train_files:
+                            train_files = sorted(set(flat))
+                        elif ('valid' in nname or 'val' in nname) and not val_files:
+                            val_files = sorted(set(flat))
+                        elif 'test' in nname and not test_files:
+                            test_files = sorted(set(flat))
+
+        # If still empty for train/val, attempt top-level 'files' list
+        if not (train_files and val_files):
+            maybe_files = info.get('files') or info.get('file_list')
+            if isinstance(maybe_files, list):
+                for entry in maybe_files:
+                    b = os.path.basename(entry)
+                    full = arrow_basenames.get(b)
+                    if not full:
+                        continue
+                    if 'train' in b.lower():
+                        train_files.append(full)
+                    elif 'val' in b.lower() or 'validation' in b.lower():
+                        val_files.append(full)
+                    elif 'test' in b.lower():
+                        test_files.append(full)
+
+        # Final sanity: if train_files or val_files are still empty, fail loudly
         if not train_files or not val_files:
-            raise ValueError("Missing train or validation Arrow files")
-        
+            raise ValueError(
+                "Could not map train/validation shards from dataset_info.json. "
+                "Make sure dataset_info.json contains 'data_files' or 'splits' with explicit file lists or filenames. "
+                f"Found {len(arrow_files)} arrow files on disk. Parsed train_files={len(train_files)}, val_files={len(val_files)}."
+            )
+
+        print(f"Train shards: {len(train_files)}, Val shards: {len(val_files)}, Test shards: {len(test_files)}")
+
         num_classes = 1000 if args.dataset.lower() == "imagenet" else 100
-        
+
         # Transforms
         train_transform = get_strong_transforms()
         val_transform = transforms.Compose([
@@ -400,11 +501,10 @@ def get_data(args):
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
-        
+
         # Create datasets
         train_dataset = LazyArrowDataset(train_files, train_transform)
         val_dataset = LazyArrowDataset(val_files, val_transform)
-        
     else:
         raise ValueError("Unsupported dataset: choose cifar100, imagenet100, or imagenet")
 
@@ -439,6 +539,7 @@ def get_data(args):
     )
 
     return train_loader, val_loader, num_classes
+
 
 # ==========================================================
 # 3.  LR Finder
